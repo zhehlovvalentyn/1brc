@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -24,9 +23,9 @@ type cityMap map[string]cityTemperatureInfo
 
 type cityTemperatureInfo struct {
 	count int64
-	min   float64
-	max   float64
-	sum   float64
+	min   int64
+	max   int64
+	sum   int64
 }
 
 type cityTemperatureResult struct {
@@ -113,9 +112,9 @@ func evaluate(fileName string, chanSize int, chunkSize int, printResult bool) er
 	for city, info := range cityMap {
 		resultArray = append(resultArray, cityTemperatureResult{
 			city: city,
-			min:  round(info.min / 10),
-			max:  round(info.max / 10),
-			avg:  round(info.sum / float64(info.count) / 10),
+			min:  round(float64(info.min) / 10),
+			max:  round(float64(info.max) / 10),
+			avg:  round(float64(info.sum) / float64(info.count) / 10),
 		})
 	}
 
@@ -182,10 +181,7 @@ func processBytes(by []byte, resultChan chan<- cityMap) {
 			startIndex = i + 1
 		case '\n':
 			if (i-startIndex) > 1 && len(city) != 0 {
-				temperature, err := strconv.ParseFloat(strings.TrimSpace(stringBuf[startIndex:i]), 64)
-				if err != nil {
-					panic(err)
-				}
+				temperature := customStringToIntParser(stringBuf[startIndex:i])
 				startIndex = i + 1
 				if val, ok := cityMap[city]; !ok {
 					cityMap[city] = cityTemperatureInfo{
@@ -220,4 +216,26 @@ func round(x float64) float64 {
 		return 0.0
 	}
 	return rounded / 10
+}
+
+// input: string containing signed number in the range [-99.9, 99.9]
+// output: signed int in the range [-999, 999]
+func customStringToIntParser(input string) (output int64) {
+	var isNegativeNumber bool
+	if input[0] == '-' {
+		isNegativeNumber = true
+		input = input[1:]
+	}
+
+	switch len(input) {
+	case 3:
+		output = int64(input[0])*10 + int64(input[2]) - int64('0')*11
+	case 4:
+		output = int64(input[0])*100 + int64(input[1])*10 + int64(input[3]) - (int64('0') * 111)
+	}
+
+	if isNegativeNumber {
+		return -output
+	}
+	return
 }
