@@ -31,9 +31,15 @@ func BenchmarkChunkSize(b *testing.B) {
 		chunkSize int
 		fileName  string
 	}{
-		{100, 10000, "data/measurements_100m.txt"},
-		{100, 100000, "data/measurements_100m.txt"},
-		{100, 1000000, "data/measurements_100m.txt"},
+		{10, 64 * 1024 * 1024, "data/measurements_100m.txt"},
+		{10, 32 * 1024 * 1024, "data/measurements_100m.txt"},
+		{10, 16 * 1024 * 1024, "data/measurements_100m.txt"},
+		{10, 8 * 1024 * 1024, "data/measurements_100m.txt"},
+		{10, 4 * 1024 * 1024, "data/measurements_100m.txt"},
+		{10, 2 * 1024 * 1024, "data/measurements_100m.txt"},
+		{10, 1 * 1024 * 1024, "data/measurements_100m.txt"},
+		{10, 512 * 1024, "data/measurements_100m.txt"},
+		{10, 256 * 1024, "data/measurements_100m.txt"},
 	}
 
 	for _, testCase := range testCases {

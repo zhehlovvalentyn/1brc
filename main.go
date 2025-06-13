@@ -1,9 +1,11 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -46,7 +48,7 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	evaluate(flag.Args()[0], 100, 1000000, true)
+	evaluate(flag.Args()[0], 10, 16*1024*1024, false)
 
 	if *memprofile != "" {
 		f, err := os.Create("./profiles/" + *memprofile)
@@ -62,7 +64,7 @@ func main() {
 }
 
 func evaluate(fileName string, chanSize int, chunkSize int, printResult bool) error {
-	lineChan := make(chan []string, chanSize)
+	byChan := make(chan []byte, chanSize)
 	resultChan := make(chan cityMap, chanSize)
 
 	workers := runtime.NumCPU() - 1
@@ -72,17 +74,17 @@ func evaluate(fileName string, chanSize int, chunkSize int, printResult bool) er
 	for range workers {
 		go func() {
 			defer wg.Done()
-			for lines := range lineChan {
-				processLine(lines, resultChan)
+			for by := range byChan {
+				processBytes(by, resultChan)
 			}
 		}()
 	}
 
 	go func() {
-		if err := readFileLines(fileName, chunkSize, lineChan); err != nil {
+		if err := readFile(fileName, chunkSize, byChan); err != nil {
 			log.Fatal("could not read file: ", err)
 		}
-		close(lineChan)
+		close(byChan)
 		wg.Wait()
 		close(resultChan)
 	}()
@@ -131,96 +133,90 @@ func evaluate(fileName string, chanSize int, chunkSize int, printResult bool) er
 	return nil
 }
 
-func readFileLines(fileName string, chunkSize int, lineChan chan []string) error {
+func readFile(fileName string, chunkSize int, byChan chan []byte) error {
 	file, err := os.Open(fileName)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
+	buf := make([]byte, chunkSize)
+	leftOver := make([]byte, 0, chunkSize)
 
-	lines := make([]string, 0, chunkSize)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-		if len(lines) == chunkSize {
-			lineChan <- lines
-			lines = make([]string, 0, chunkSize)
+	for {
+		readTotal, err := file.Read(buf)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			panic(err)
 		}
-	}
+		buf = buf[:readTotal]
 
-	if len(lines) > 0 {
-		lineChan <- lines
+		toSend := make([]byte, readTotal)
+		copy(toSend, buf)
+
+		lastNewLineIndex := bytes.LastIndex(buf, []byte{'\n'})
+
+		toSend = append(leftOver, buf[:lastNewLineIndex+1]...)
+		leftOver = make([]byte, len(buf[lastNewLineIndex+1:]))
+		copy(leftOver, buf[lastNewLineIndex+1:])
+
+		byChan <- toSend
 	}
 
 	return nil
 }
 
-func parseLine(line string) (string, string, error) {
-	parts := strings.Split(line, ";")
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("invalid line: %s", line)
-	}
+func processBytes(by []byte, resultChan chan<- cityMap) {
+	cityMap := make(cityMap)
+	var city string
+	var startIndex int
 
-	city := parts[0]
-	temperature := parts[1]
+	stringBuf := string(by)
 
-	return city, temperature, nil
-}
+	for i, char := range stringBuf {
+		switch char {
+		case ';':
+			city = stringBuf[startIndex:i]
+			startIndex = i + 1
+		case '\n':
+			if (i-startIndex) > 1 && len(city) != 0 {
+				temperature, err := strconv.ParseFloat(strings.TrimSpace(stringBuf[startIndex:i]), 64)
+				if err != nil {
+					panic(err)
+				}
+				startIndex = i + 1
+				if val, ok := cityMap[city]; !ok {
+					cityMap[city] = cityTemperatureInfo{
+						count: 1,
+						min:   temperature,
+						max:   temperature,
+						sum:   temperature,
+					}
+				} else {
+					val.count++
+					val.sum += temperature
+					if temperature < val.min {
+						val.min = temperature
+					}
+					if temperature > val.max {
+						val.max = temperature
+					}
+					cityMap[city] = val
+				}
 
-func processLine(lines []string, resultChan chan cityMap) {
-	cityMap := make(map[string]cityTemperatureInfo)
-
-	for _, line := range lines {
-		city, temperature, err := parseLine(line)
-		if err != nil {
-			panic(err)
-		}
-
-		temperatureFloat, err := strconv.ParseFloat(strings.TrimSpace(temperature), 64)
-		if err != nil {
-			panic(err)
-		}
-
-		if _, ok := cityMap[city]; !ok {
-			cityMap[city] = cityTemperatureInfo{
-				count: 1,
-				min:   temperatureFloat,
-				max:   temperatureFloat,
-				sum:   temperatureFloat,
-			}
-		} else {
-			// update city temperature info
-			tempMin := cityMap[city].min
-			tempMax := cityMap[city].max
-			tempSum := cityMap[city].sum
-			tempCount := cityMap[city].count
-
-			if temperatureFloat < tempMin {
-				tempMin = temperatureFloat
-			}
-			if temperatureFloat > tempMax {
-				tempMax = temperatureFloat
-			}
-			tempSum += temperatureFloat
-			tempCount++
-
-			cityMap[city] = cityTemperatureInfo{
-				count: tempCount,
-				min:   tempMin,
-				max:   tempMax,
-				sum:   tempSum,
+				city = ""
 			}
 		}
 	}
-
 	resultChan <- cityMap
 }
 
 // round toward positive
 func round(x float64) float64 {
 	rounded := math.Round(x * 10)
-	if rounded == -0.0 {
+	if rounded == 0.0 {
 		return 0.0
 	}
 	return rounded / 10
