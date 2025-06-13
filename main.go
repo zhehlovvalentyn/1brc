@@ -5,9 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -15,13 +17,20 @@ import (
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 var memprofile = flag.String("memprofile", "", "write memory profile to file")
 
-type cityMap map[string]cityTemperatureInfo
+type cityMap struct {
+	m map[string]cityTemperatureInfo
+}
 
 type cityTemperatureInfo struct {
 	count int64
 	min   float64
 	max   float64
 	sum   float64
+}
+
+type cityTemperatureResult struct {
+	city          string
+	min, max, avg float64
 }
 
 func main() {
@@ -38,7 +47,7 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	fmt.Println(evaluate(flag.Args()[0]))
+	evaluate(flag.Args()[0])
 
 	if *memprofile != "" {
 		f, err := os.Create("./profiles/" + *memprofile)
@@ -59,55 +68,33 @@ func evaluate(fileName string) error {
 		return err
 	}
 
-	cityMap := make(cityMap)
-
-	for _, line := range lines {
-		city, temperature, err := parseLine(line)
-		if err != nil {
-			return err
-		}
-
-		temperatureFloat, err := strconv.ParseFloat(strings.TrimSpace(temperature), 64)
-		if err != nil {
-			return err
-		}
-
-		if _, ok := cityMap[city]; !ok {
-			cityMap[city] = cityTemperatureInfo{
-				count: 1,
-				min:   temperatureFloat,
-				max:   temperatureFloat,
-				sum:   temperatureFloat,
-			}
-		} else {
-			// update city temperature info
-			tempMin := cityMap[city].min
-			tempMax := cityMap[city].max
-			tempSum := cityMap[city].sum
-			tempCount := cityMap[city].count
-
-			if temperatureFloat < tempMin {
-				tempMin = temperatureFloat
-			}
-			if temperatureFloat > tempMax {
-				tempMax = temperatureFloat
-			}
-			tempSum += temperatureFloat
-			tempCount++
-
-			cityMap[city] = cityTemperatureInfo{
-				count: tempCount,
-				min:   tempMin,
-				max:   tempMax,
-				sum:   tempSum,
-			}
-		}
+	cityMap := cityMap{
+		m: make(map[string]cityTemperatureInfo),
 	}
 
-	for city, info := range cityMap {
-		fmt.Printf("%s: %d, %f, %f, %f\n", city, info.count, info.min, info.max, info.sum)
+	for _, l := range lines {
+		processLine(l, &cityMap)
 	}
 
+	resultArray := make([]cityTemperatureResult, 0, len(cityMap.m))
+	for city, info := range cityMap.m {
+		resultArray = append(resultArray, cityTemperatureResult{
+			city: city,
+			min:  round(info.min / 10),
+			max:  round(info.max / 10),
+			avg:  round(info.sum / float64(info.count) / 10),
+		})
+	}
+
+	sort.Slice(resultArray, func(i, j int) bool {
+		return resultArray[i].city < resultArray[j].city
+	})
+
+	var stringsBuilder strings.Builder
+	for _, i := range resultArray {
+		stringsBuilder.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f; ", i.city, i.min, i.avg, i.max))
+	}
+	_, _ = os.Stdout.WriteString(stringsBuilder.String()[:stringsBuilder.Len()-1])
 	return nil
 }
 
@@ -138,4 +125,56 @@ func parseLine(line string) (string, string, error) {
 	temperature := parts[1]
 
 	return city, temperature, nil
+}
+
+func processLine(line string, cityMap *cityMap) {
+	city, temperature, err := parseLine(line)
+	if err != nil {
+		panic(err)
+	}
+
+	temperatureFloat, err := strconv.ParseFloat(strings.TrimSpace(temperature), 64)
+	if err != nil {
+		panic(err)
+	}
+
+	if _, ok := cityMap.m[city]; !ok {
+		cityMap.m[city] = cityTemperatureInfo{
+			count: 1,
+			min:   temperatureFloat,
+			max:   temperatureFloat,
+			sum:   temperatureFloat,
+		}
+	} else {
+		// update city temperature info
+		tempMin := cityMap.m[city].min
+		tempMax := cityMap.m[city].max
+		tempSum := cityMap.m[city].sum
+		tempCount := cityMap.m[city].count
+
+		if temperatureFloat < tempMin {
+			tempMin = temperatureFloat
+		}
+		if temperatureFloat > tempMax {
+			tempMax = temperatureFloat
+		}
+		tempSum += temperatureFloat
+		tempCount++
+
+		cityMap.m[city] = cityTemperatureInfo{
+			count: tempCount,
+			min:   tempMin,
+			max:   tempMax,
+			sum:   tempSum,
+		}
+	}
+}
+
+// round toward positive
+func round(x float64) float64 {
+	rounded := math.Round(x * 10)
+	if rounded == -0.0 {
+		return 0.0
+	}
+	return rounded / 10
 }
