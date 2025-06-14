@@ -50,3 +50,22 @@ func BenchmarkChunkSize(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkEvaluate(b *testing.B) {
+	testCases := []struct {
+		testName string
+		function func(string, int, int, bool) error
+		fileName string
+	}{
+		{"read", evaluate, "data/measurements_100m.txt"},
+		{"mmap", evaluateMmap, "data/measurements_100m.txt"},
+	}
+
+	for _, testCase := range testCases {
+		b.Run(testCase.testName, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				testCase.function(testCase.fileName, 10, 16*1024*1024, false)
+			}
+		})
+	}
+}

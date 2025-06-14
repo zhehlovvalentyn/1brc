@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
@@ -172,16 +173,14 @@ func processBytes(by []byte, resultChan chan<- cityMap) {
 	var city string
 	var startIndex int
 
-	stringBuf := string(by)
-
-	for i, char := range stringBuf {
+	for i, char := range by {
 		switch char {
 		case ';':
-			city = stringBuf[startIndex:i]
+			city = string(by[startIndex:i])
 			startIndex = i + 1
 		case '\n':
 			if (i-startIndex) > 1 && len(city) != 0 {
-				temperature := customStringToIntParser(stringBuf[startIndex:i])
+				temperature := customStringToIntParser(by[startIndex:i])
 				startIndex = i + 1
 				if val, ok := cityMap[city]; !ok {
 					cityMap[city] = cityTemperatureInfo{
@@ -220,7 +219,7 @@ func round(x float64) float64 {
 
 // input: string containing signed number in the range [-99.9, 99.9]
 // output: signed int in the range [-999, 999]
-func customStringToIntParser(input string) (output int64) {
+func customStringToIntParser(input []byte) (output int64) {
 	var isNegativeNumber bool
 	if input[0] == '-' {
 		isNegativeNumber = true
@@ -229,13 +228,101 @@ func customStringToIntParser(input string) (output int64) {
 
 	switch len(input) {
 	case 3:
-		output = int64(input[0])*10 + int64(input[2]) - int64('0')*11
+		// 1.2 -> 12
+		output = int64(input[0])*10 + int64(input[2]) - '0'*11
 	case 4:
-		output = int64(input[0])*100 + int64(input[1])*10 + int64(input[3]) - (int64('0') * 111)
+		// 11.2 -> 112
+		output = int64(input[0])*100 + int64(input[1])*10 + int64(input[3]) - '0'*111
 	}
 
 	if isNegativeNumber {
 		return -output
 	}
 	return
+}
+
+func evaluateMmap(fileName string, chanSize int, chunkSize int, printResult bool) error {
+	f, err := os.Open(fileName)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	stat, _ := f.Stat()
+	size := stat.Size()
+
+	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		panic(err)
+	}
+	defer syscall.Munmap(data)
+
+	workers := runtime.NumCPU()
+	leftOver := 0
+	workerSize := len(data) / workers
+	resultChan := make(chan cityMap, chanSize)
+	wg := sync.WaitGroup{}
+	wg.Add(workers)
+
+	for workerID := 0; workerID < workers; workerID++ {
+		startIndex := workerSize*workerID - leftOver
+
+		lastIndex := workerSize * (workerID + 1)
+		if lastIndex > len(data) {
+			lastIndex = len(data)
+		}
+		lastNewLineIndex := bytes.LastIndex(data[:lastIndex], []byte{'\n'})
+		leftOver = lastIndex - lastNewLineIndex - 1
+
+		go func() {
+			defer wg.Done()
+			processBytes(data[startIndex:lastIndex], resultChan)
+		}()
+	}
+
+	wg.Wait()
+	close(resultChan)
+
+	cityMap := make(cityMap)
+	for t := range resultChan {
+		for city, tempInfo := range t {
+			if val, ok := cityMap[city]; ok {
+				val.count += tempInfo.count
+				val.sum += tempInfo.sum
+				if tempInfo.min < val.min {
+					val.min = tempInfo.min
+				}
+
+				if tempInfo.max > val.max {
+					val.max = tempInfo.max
+				}
+				cityMap[city] = val
+			} else {
+				cityMap[city] = tempInfo
+			}
+		}
+	}
+
+	resultArray := make([]cityTemperatureResult, 0, len(cityMap))
+	for city, info := range cityMap {
+		resultArray = append(resultArray, cityTemperatureResult{
+			city: city,
+			min:  round(float64(info.min) / 10),
+			max:  round(float64(info.max) / 10),
+			avg:  round(float64(info.sum) / float64(info.count) / 10),
+		})
+	}
+
+	sort.Slice(resultArray, func(i, j int) bool {
+		return resultArray[i].city < resultArray[j].city
+	})
+
+	var stringsBuilder strings.Builder
+	for _, i := range resultArray {
+		stringsBuilder.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f; ", i.city, i.min, i.avg, i.max))
+	}
+	if printResult {
+		_, _ = os.Stdout.WriteString(stringsBuilder.String()[:stringsBuilder.Len()-1])
+	}
+	return nil
 }
