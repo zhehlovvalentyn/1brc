@@ -51,7 +51,7 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	evaluateMmap(flag.Args()[0], 10, 16*1024*1024, false)
+	evaluateMmap(flag.Args()[0], workerCount, 16*1024*1024, false)
 
 	if *memprofile != "" {
 		f, err := os.Create("./profiles/" + *memprofile)

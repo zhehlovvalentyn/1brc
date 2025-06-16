@@ -64,7 +64,7 @@ func BenchmarkEvaluate(b *testing.B) {
 	for _, testCase := range testCases {
 		b.Run(testCase.testName, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				testCase.function(testCase.fileName, 10, 16*1024*1024, false)
+				testCase.function(testCase.fileName, workerCount, 16*1024*1024, false)
 			}
 		})
 	}
