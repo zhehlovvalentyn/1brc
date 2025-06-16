@@ -4,15 +4,14 @@ import (
 	"bytes"
 	"errors"
 	"flag"
-	"fmt"
+	"hash/maphash"
 	"io"
 	"log"
-	"math"
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"sort"
-	"strings"
+	"slices"
+	"strconv"
 	"sync"
 	"syscall"
 )
@@ -20,18 +19,22 @@ import (
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 var memprofile = flag.String("memprofile", "", "write memory profile to file")
 
-type cityMap map[string]cityTemperatureInfo
+const (
+	numberOfMaxStations = 10_000
+	workerCount         = 10
+)
+
+var maphashSeed = maphash.MakeSeed()
+
+type WorkerResults [workerCount][numberOfMaxStations]cityTemperatureInfo
+
+type cityMap [numberOfMaxStations]cityTemperatureInfo
 
 type cityTemperatureInfo struct {
 	count int64
 	min   int64
 	max   int64
 	sum   int64
-}
-
-type cityTemperatureResult struct {
-	city          string
-	min, max, avg float64
 }
 
 func main() {
@@ -48,7 +51,7 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	evaluate(flag.Args()[0], 10, 16*1024*1024, false)
+	evaluateMmap(flag.Args()[0], 10, 16*1024*1024, false)
 
 	if *memprofile != "" {
 		f, err := os.Create("./profiles/" + *memprofile)
@@ -64,157 +67,175 @@ func main() {
 }
 
 func evaluate(fileName string, chanSize int, chunkSize int, printResult bool) error {
-	byChan := make(chan []byte, chanSize)
-	resultChan := make(chan cityMap, chanSize)
-
 	workers := runtime.NumCPU() - 1
+	var (
+		stationNames     = make([][]byte, 0, numberOfMaxStations)
+		stationSymbolMap = make(map[uint64]uint64, numberOfMaxStations)
+		workerResults    = WorkerResults{}
+	)
+	byChan := make(chan []byte, chanSize)
+
 	wg := sync.WaitGroup{}
 	wg.Add(workers)
 
-	for range workers {
-		go func() {
+	for i := 0; i < workers; i++ {
+		go func(workerID int) {
 			defer wg.Done()
 			for by := range byChan {
-				processBytes(by, resultChan)
-			}
-		}()
-	}
+				var stationID uint64
+				var startIndex int
+				cityM := &workerResults[workerID]
 
-	go func() {
-		if err := readFile(fileName, chunkSize, byChan); err != nil {
-			log.Fatal("could not read file: ", err)
-		}
-		close(byChan)
-		wg.Wait()
-		close(resultChan)
-	}()
+				for i, char := range by {
+					switch char {
+					case ';':
+						stationID = maphash.Bytes(maphashSeed, by[startIndex:i])
+						startIndex = i + 1
+					case '\n':
+						if (i-startIndex) > 1 && stationID != 0 {
+							temperature := customStringToIntParser(by[startIndex:i])
+							startIndex = i + 1
 
-	cityMap := make(cityMap)
-	for t := range resultChan {
-		for city, tempInfo := range t {
-			if val, ok := cityMap[city]; ok {
-				val.count += tempInfo.count
-				val.sum += tempInfo.sum
-				if tempInfo.min < val.min {
-					val.min = tempInfo.min
+							stationIndex := stationSymbolMap[stationID]
+
+							if cityM[stationIndex].count == 0 {
+								cityM[stationIndex] = cityTemperatureInfo{
+									count: 1,
+									min:   temperature,
+									max:   temperature,
+									sum:   temperature,
+								}
+							} else {
+								cityM[stationIndex].count++
+								cityM[stationIndex].sum += temperature
+								if temperature < cityM[stationIndex].min {
+									cityM[stationIndex].min = temperature
+								}
+								if temperature > cityM[stationIndex].max {
+									cityM[stationIndex].max = temperature
+								}
+							}
+						}
+					}
 				}
-
-				if tempInfo.max > val.max {
-					val.max = tempInfo.max
-				}
-				cityMap[city] = val
-			} else {
-				cityMap[city] = tempInfo
 			}
-		}
+		}(i)
 	}
 
-	resultArray := make([]cityTemperatureResult, 0, len(cityMap))
-	for city, info := range cityMap {
-		resultArray = append(resultArray, cityTemperatureResult{
-			city: city,
-			min:  round(float64(info.min) / 10),
-			max:  round(float64(info.max) / 10),
-			avg:  round(float64(info.sum) / float64(info.count) / 10),
-		})
-	}
-
-	sort.Slice(resultArray, func(i, j int) bool {
-		return resultArray[i].city < resultArray[j].city
-	})
-
-	var stringsBuilder strings.Builder
-	for _, i := range resultArray {
-		stringsBuilder.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f; ", i.city, i.min, i.avg, i.max))
-	}
-	if printResult {
-		_, _ = os.Stdout.WriteString(stringsBuilder.String()[:stringsBuilder.Len()-1])
-	}
-	return nil
-}
-
-func readFile(fileName string, chunkSize int, byChan chan []byte) error {
-	file, err := os.Open(fileName)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	buf := make([]byte, chunkSize)
-	leftOver := make([]byte, 0, chunkSize)
-
-	for {
-		readTotal, err := file.Read(buf)
+	{
+		file, err := os.Open(fileName)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
 			panic(err)
 		}
-		buf = buf[:readTotal]
+		defer file.Close()
 
-		toSend := make([]byte, readTotal)
-		copy(toSend, buf)
+		buf := make([]byte, chunkSize)
+		leftOver := make([]byte, 0, chunkSize)
 
-		lastNewLineIndex := bytes.LastIndex(buf, []byte{'\n'})
+		firstIteration := true
 
-		toSend = append(leftOver, buf[:lastNewLineIndex+1]...)
-		leftOver = make([]byte, len(buf[lastNewLineIndex+1:]))
-		copy(leftOver, buf[lastNewLineIndex+1:])
+		for {
+			readTotal, err := file.Read(buf)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				panic(err)
+			}
+			buf = buf[:readTotal]
 
-		byChan <- toSend
+			toSend := make([]byte, readTotal)
+			copy(toSend, buf)
+
+			lastNewLineIndex := bytes.LastIndex(buf, []byte{'\n'})
+
+			toSend = append(leftOver, buf[:lastNewLineIndex+1]...)
+			leftOver = make([]byte, len(buf[lastNewLineIndex+1:]))
+			copy(leftOver, buf[lastNewLineIndex+1:])
+
+			if firstIteration {
+				stationNames, stationSymbolMap = getAllStationNames(toSend)
+				firstIteration = false
+			}
+
+			byChan <- toSend
+		}
+	}
+	close(byChan)
+	wg.Wait()
+
+	var cityMapResults cityMap
+	for _, t := range workerResults {
+		for i, tempInfo := range t {
+			if cityMapResults[i].count == 0 {
+				cityMapResults[i] = tempInfo
+			} else {
+				cityMapResults[i].count += tempInfo.count
+				cityMapResults[i].sum += tempInfo.sum
+				if tempInfo.min < cityMapResults[i].min {
+					cityMapResults[i].min = tempInfo.min
+				}
+				if tempInfo.max > cityMapResults[i].max {
+					cityMapResults[i].max = tempInfo.max
+				}
+			}
+		}
 	}
 
+	slices.SortFunc(stationNames, func(a, b []byte) int {
+		return bytes.Compare(a, b)
+	})
+
+	var result cityTemperatureInfo
+
+	buf := make([]byte, 0, 50000)
+	buf = append(buf, '{')
+
+	// Print workerResults {station1=min/avg/max, station2=min/avg/max, ...}
+	for i, station := range stationNames {
+		if i != 0 {
+			buf = append(buf, ',', ' ')
+		}
+
+		result = cityMapResults[stationSymbolMap[maphash.Bytes(maphashSeed, station)]]
+
+		buf = append(buf, station...)
+		buf = append(buf, '=')
+		buf = append(buf, strconv.FormatFloat(float64(result.min)/10, 'f', 1, 64)...)
+		buf = append(buf, '/')
+		buf = append(buf, strconv.FormatFloat(float64(result.sum)/(float64(result.count)*10), 'f', 1, 64)...)
+		buf = append(buf, '/')
+		buf = append(buf, strconv.FormatFloat(float64(result.max)/10, 'f', 1, 64)...)
+	}
+
+	buf = append(buf, '}', '\n')
+	if printResult {
+		_, _ = os.Stdout.Write(buf)
+	}
 	return nil
 }
 
-func processBytes(by []byte, resultChan chan<- cityMap) {
-	cityMap := make(cityMap)
-	var city string
+func getAllStationNames(by []byte) ([][]byte, map[uint64]uint64) {
+	stationNames := make([][]byte, 0, numberOfMaxStations)
+	stationSymbolMap := make(map[uint64]uint64, numberOfMaxStations)
 	var startIndex int
 
+	var id uint64
 	for i, char := range by {
 		switch char {
 		case ';':
-			city = string(by[startIndex:i])
-			startIndex = i + 1
-		case '\n':
-			if (i-startIndex) > 1 && len(city) != 0 {
-				temperature := customStringToIntParser(by[startIndex:i])
-				startIndex = i + 1
-				if val, ok := cityMap[city]; !ok {
-					cityMap[city] = cityTemperatureInfo{
-						count: 1,
-						min:   temperature,
-						max:   temperature,
-						sum:   temperature,
-					}
-				} else {
-					val.count++
-					val.sum += temperature
-					if temperature < val.min {
-						val.min = temperature
-					}
-					if temperature > val.max {
-						val.max = temperature
-					}
-					cityMap[city] = val
-				}
-
-				city = ""
+			stationID := maphash.Bytes(maphashSeed, by[startIndex:i])
+			if _, ok := stationSymbolMap[stationID]; !ok {
+				stationNames = append(stationNames, by[startIndex:i])
+				stationSymbolMap[stationID] = id
+				id++
 			}
+		case '\n':
+			startIndex = i + 1
 		}
 	}
-	resultChan <- cityMap
-}
 
-// round toward positive
-func round(x float64) float64 {
-	rounded := math.Round(x * 10)
-	if rounded == 0.0 {
-		return 0.0
-	}
-	return rounded / 10
+	return stationNames, stationSymbolMap
 }
 
 // input: string containing signed number in the range [-99.9, 99.9]
@@ -241,7 +262,14 @@ func customStringToIntParser(input []byte) (output int64) {
 	return
 }
 
-func evaluateMmap(fileName string, chanSize int, chunkSize int, printResult bool) error {
+func evaluateMmap(fileName string, _ int, _ int, printResult bool) error {
+	var (
+		workerResults    = WorkerResults{}
+		stationNames     = make([][]byte, 0, numberOfMaxStations)
+		stationResults   = [numberOfMaxStations]cityTemperatureInfo{}
+		stationSymbolMap = make(map[uint64]uint64, numberOfMaxStations)
+	)
+
 	f, err := os.Open(fileName)
 	if err != nil {
 		panic(err)
@@ -257,72 +285,177 @@ func evaluateMmap(fileName string, chanSize int, chunkSize int, printResult bool
 	}
 	defer syscall.Munmap(data)
 
-	workers := runtime.NumCPU()
-	leftOver := 0
-	workerSize := len(data) / workers
-	resultChan := make(chan cityMap, chanSize)
-	wg := sync.WaitGroup{}
-	wg.Add(workers)
+	var (
+		id        uint64
+		pos       int
+		off       int
+		stationID uint64
+	)
 
-	for workerID := 0; workerID < workers; workerID++ {
-		startIndex := workerSize*workerID - leftOver
-
-		lastIndex := workerSize * (workerID + 1)
-		if lastIndex > len(data) {
-			lastIndex = len(data)
+	// get all station names, assume all station are in the first 5_000_000 lines
+	for pos <= 5_000_000 {
+		for j, c := range data[pos:] {
+			if c == ';' {
+				off = j
+				break
+			}
 		}
-		lastNewLineIndex := bytes.LastIndex(data[:lastIndex], []byte{'\n'})
-		leftOver = lastIndex - lastNewLineIndex - 1
 
-		go func() {
-			defer wg.Done()
-			processBytes(data[startIndex:lastIndex], resultChan)
-		}()
+		stationID = maphash.Bytes(maphashSeed, data[pos:pos+off])
+		if _, ok := stationSymbolMap[stationID]; !ok {
+			stationNames = append(stationNames, data[pos:pos+off])
+			stationSymbolMap[stationID] = id
+			id++
+		}
+
+		pos += off + 2
+
+		if data[pos+2] == '.' {
+			// -21.3\n
+			pos += 5
+		} else if data[pos+1] == '.' {
+			// 21.3\n or -1.3\n
+			pos += 4
+		} else if data[pos] == '.' {
+			// 1.3\n
+			pos += 3
+		}
 	}
 
-	wg.Wait()
-	close(resultChan)
+	workerSize := len(data) / workerCount
 
-	cityMap := make(cityMap)
-	for t := range resultChan {
-		for city, tempInfo := range t {
-			if val, ok := cityMap[city]; ok {
-				val.count += tempInfo.count
-				val.sum += tempInfo.sum
-				if tempInfo.min < val.min {
-					val.min = tempInfo.min
+	done := make(chan struct{}, workerCount)
+
+	go func() {
+		// sort station names
+		slices.SortFunc(stationNames, func(a, b []byte) int {
+			return bytes.Compare(a, b)
+		})
+
+		done <- struct{}{}
+	}()
+
+	for workerID := 0; workerID < workerCount; workerID++ {
+		// process data in parallel
+		go func(workerID int, data []byte) {
+			last := workerSize*(workerID+1) + 20
+			if last > len(data) {
+				last = len(data) - 1
+			}
+
+			data = data[workerSize*workerID : last]
+			data = data[bytes.IndexByte(data, '\n')+1 : bytes.LastIndexByte(data, '\n')+1]
+
+			var (
+				pos         int
+				off         int
+				stationID   uint64
+				temperature int64
+			)
+
+			for {
+				// find semicolon to get station name
+				off = -1
+
+				for j, c := range data[pos:] {
+					if c == ';' {
+						off = j
+						break
+					}
 				}
 
-				if tempInfo.max > val.max {
-					val.max = tempInfo.max
+				if off == -1 {
+					break
 				}
-				cityMap[city] = val
-			} else {
-				cityMap[city] = tempInfo
+
+				// translate station name to station ID
+				stationID = stationSymbolMap[maphash.Bytes(maphashSeed, data[pos:pos+off])]
+				pos += off + 1
+
+				// parse temperature
+				{
+					negative := data[pos] == '-'
+					if negative {
+						pos++
+					}
+
+					if data[pos+1] == '.' {
+						// 1.2\n
+						temperature = int64(data[pos+2]) + int64(data[pos+0])*10 - '0'*(11)
+						pos += 4
+					} else {
+						// 12.3\n
+						temperature = int64(data[pos+3]) + int64(data[pos+1])*10 + int64(data[pos+0])*100 - '0'*(111)
+						pos += 5
+					}
+
+					if negative {
+						temperature = -temperature
+					}
+				}
+
+				workerResults[workerID][stationID].count++
+				workerResults[workerID][stationID].sum += temperature
+				if temperature < workerResults[workerID][stationID].min {
+					workerResults[workerID][stationID].min = temperature
+				}
+				if temperature > workerResults[workerID][stationID].max {
+					workerResults[workerID][stationID].max = temperature
+				}
+			}
+
+			done <- struct{}{}
+		}(workerID, data)
+	}
+
+	// wait for all workers to finish
+	for i := 0; i <= workerCount; i++ {
+		<-done
+	}
+
+	// merge workerResults
+	for _, result := range workerResults {
+		for stationID, stationResult := range result {
+			if stationResult.count == 0 {
+				continue
+			}
+
+			stationResults[stationID].sum += stationResult.sum
+			stationResults[stationID].count += stationResult.count
+			if stationResult.min < stationResults[stationID].min {
+				stationResults[stationID].min = stationResult.min
+			}
+			if stationResult.max > stationResults[stationID].max {
+				stationResults[stationID].max = stationResult.max
 			}
 		}
 	}
 
-	resultArray := make([]cityTemperatureResult, 0, len(cityMap))
-	for city, info := range cityMap {
-		resultArray = append(resultArray, cityTemperatureResult{
-			city: city,
-			min:  round(float64(info.min) / 10),
-			max:  round(float64(info.max) / 10),
-			avg:  round(float64(info.sum) / float64(info.count) / 10),
-		})
+	var result cityTemperatureInfo
+
+	buf := make([]byte, 0, 50000)
+	buf = append(buf, '{')
+
+	// Print workerResults {station1=min/avg/max, station2=min/avg/max, ...}
+	for i, station := range stationNames {
+		if i != 0 {
+			buf = append(buf, ',', ' ')
+		}
+
+		result = stationResults[stationSymbolMap[maphash.Bytes(maphashSeed, station)]]
+
+		buf = append(buf, station...)
+		buf = append(buf, '=')
+		buf = append(buf, strconv.FormatFloat(float64(result.min)/10, 'f', 1, 64)...)
+		buf = append(buf, '/')
+		buf = append(buf, strconv.FormatFloat(float64(result.sum)/(float64(result.count)*10), 'f', 1, 64)...)
+		buf = append(buf, '/')
+		buf = append(buf, strconv.FormatFloat(float64(result.max)/10, 'f', 1, 64)...)
 	}
 
-	sort.Slice(resultArray, func(i, j int) bool {
-		return resultArray[i].city < resultArray[j].city
-	})
-
-	var stringsBuilder strings.Builder
-	for _, i := range resultArray {
-		stringsBuilder.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f; ", i.city, i.min, i.avg, i.max))
-	}
+	buf = append(buf, '}', '\n')
 	if printResult {
-		_, _ = os.Stdout.WriteString(stringsBuilder.String()[:stringsBuilder.Len()-1])
+		_, _ = os.Stdout.Write(buf)
 	}
 	return nil
 }
